@@ -128,6 +128,117 @@
    }                        \
  } ///< Wire, SPI or bitbang transfer end
 
+#include <variant.h>
+#ifdef _VARIANT_FEATHER_M4_
+#define NON_BLOCKING_DISPLAY
+#endif
+
+#ifdef NON_BLOCKING_DISPLAY
+
+static uint32_t vtor_prior = 0xffffffff;
+
+static void replace_sercom2_interrupt_handler(void * handler) {
+  /* unfortunately we need to make a copy of the entire device vector table in sram in order to be able to modify it at runtime */
+  static DeviceVectors device_vectors_in_ram __attribute((aligned(1024)));
+
+  /* disable irqs while we mess with vtor */
+  __disable_irq();
+  /* if vtor is not a value we know we've already memcpy'd from... */
+  if (SCB->VTOR != vtor_prior)
+    memcpy(&device_vectors_in_ram, (void *)SCB->VTOR, sizeof(DeviceVectors));
+
+  /* modify the relevant entry in the copy in sram */
+  device_vectors_in_ram.pfnSERCOM2_0_Handler = handler;
+
+  /* save the value of VTOR and change it to point at the copy in sram */
+  vtor_prior = SCB->VTOR;
+  SCB->VTOR = (uint32_t)&device_vectors_in_ram;
+
+  /* flush and reenable irqs */
+  __DSB();
+  __enable_irq();
+}
+
+static void restore_sercom2_interrupt_handler(void) {
+  __disable_irq();
+  SCB->VTOR = (uint32_t)vtor_prior;
+  __DSB();
+  __enable_irq();  
+}
+
+static const uint8_t * data_start = NULL, * data_stop = NULL;
+static volatile char transmitting = 0;
+static uint16_t clock_value_to_restore;
+
+static void sercom2_0_handler_for_nonblocking_write(void) {
+    /* if the last write was the final queued write... */
+    if (data_start == data_stop) {
+        /* send the stop command */
+        SERCOM2->I2CM.CTRLB.reg |= SERCOM_I2CM_CTRLB_CMD(0x3);
+        
+        /* disable interrupt generation */
+        SERCOM2->I2CM.INTENCLR.reg = SERCOM_I2CM_INTENCLR_MB;
+        restore_sercom2_interrupt_handler();
+
+        /* run the ssd1306 transaction end code */
+        Wire.setClock(clock_value_to_restore);
+        
+        /* notify main thread that it can start the next transmission */
+        transmitting = 0;
+    }
+    else
+    /* send the next enqueued byte */
+        SERCOM2->I2CM.DATA.bit.DATA = *(data_start++);
+    
+    /* wait for the above transmission to take */
+    while (SERCOM2->I2CM.SYNCBUSY.bit.SYSOP);
+    
+    /* clear the interrupt flag by writing to it. yes, and this confuses gcc too, this is expected */
+    SERCOM2->I2CM.INTFLAG.bit.MB = 1;
+    
+    /* wait for the interrupt flag to actually clear */
+    while (SERCOM2->I2CM.INTFLAG.bit.MB);
+}
+
+static void non_blocking_write(uint8_t device_address, uint8_t reg_address, const uint8_t * data, size_t quantity) {
+    /* if a previous non-blocking write is still in progress, block until it finishes */
+    while (transmitting)
+        __WFI();
+    
+    /* wait for bus state to be idle or owner */
+    while (!(SERCOM2->I2CM.STATUS.bit.BUSSTATE == 0x1) &&
+           !(SERCOM2->I2CM.STATUS.bit.BUSSTATE == 0x2) );
+    
+    /* send address, and wait for it to finish sending */
+    SERCOM2->I2CM.ADDR.bit.ADDR = SERCOM_I2CM_ADDR_ADDR((device_address << 0x1ul) | 0);
+    while (!SERCOM2->I2CM.INTFLAG.bit.MB);
+    
+    /* clear interrupt flag and wait for it to be down again */
+    SERCOM2->I2CM.INTFLAG.bit.MB = 1;
+    while (SERCOM2->I2CM.INTFLAG.bit.MB);
+    
+    /* prepare the send queue */
+    data_start = data;
+    data_stop = data + quantity;
+    transmitting = 1;
+    
+    /* enable interrupt */
+    replace_sercom2_interrupt_handler((void *)sercom2_0_handler_for_nonblocking_write);
+    SERCOM2->I2CM.INTENSET.reg = SERCOM_I2CM_INTENSET_MB;
+    
+    /* send the first byte, which kicks off the rest via the interrupt handler */
+    SERCOM2->I2CM.DATA.bit.DATA = reg_address;
+    while (SERCOM2->I2CM.SYNCBUSY.bit.SYSOP);
+}
+
+static void non_blocking_write_flush(void) {
+  while (transmitting)
+    __WFI();
+}
+#else
+static void non_blocking_write_flush(void) { }
+#endif
+
 // CONSTRUCTORS, DESTRUCTOR ------------------------------------------------
 
 /*!
@@ -329,6 +440,7 @@ Adafruit_SSD1306::Adafruit_SSD1306(int8_t rst_pin) :
     @brief  Destructor for Adafruit_SSD1306 object.
 */
 Adafruit_SSD1306::~Adafruit_SSD1306(void) {
+  non_blocking_write_flush();
   if(buffer) {
     free(buffer);
     buffer = NULL;
@@ -364,6 +476,7 @@ inline void Adafruit_SSD1306::SPIwrite(uint8_t d) {
 // This is a private function, not exposed (see ssd1306_command() instead).
 void Adafruit_SSD1306::ssd1306_command1(uint8_t c) {
   if(wire) { // I2C
+    non_blocking_write_flush();
     wire->beginTransmission(i2caddr);
     WIRE_WRITE((uint8_t)0x00); // Co = 0, D/C = 0
     WIRE_WRITE(c);
@@ -378,6 +491,7 @@ void Adafruit_SSD1306::ssd1306_command1(uint8_t c) {
 // This is a private function, not exposed.
 void Adafruit_SSD1306::ssd1306_commandList(const uint8_t *c, uint8_t n) {
   if(wire) { // I2C
+    non_blocking_write_flush();
     wire->beginTransmission(i2caddr);
     WIRE_WRITE((uint8_t)0x00); // Co = 0, D/C = 0
     uint8_t bytesOut = 1;
@@ -883,6 +997,7 @@ uint8_t *Adafruit_SSD1306::getBuffer(void) {
             of graphics commands, as best needed by one's own application.
 */
 void Adafruit_SSD1306::display(void) {
+  non_blocking_write_flush();
   TRANSACTION_START
   static const uint8_t PROGMEM dlist1[] = {
     SSD1306_PAGEADDR,
@@ -904,6 +1019,23 @@ void Adafruit_SSD1306::display(void) {
 #endif
   uint16_t count = WIDTH * ((HEIGHT + 7) / 8);
   uint8_t *ptr   = buffer;
+
+#ifdef NON_BLOCKING_DISPLAY
+  /* only if we are pretty sure we should be doing the non blocking version */
+  if (wire && wire == &Wire) {
+    /* memcpy so that drawing commands can immediately begin preparing the next frame */
+    static uint8_t * buffer_alt;
+    if (!buffer_alt) buffer_alt = (uint8_t *)malloc(count);
+    memcpy(buffer_alt, ptr, count);
+      
+    /* explicitly store this so we can do the equivalent of TRANSACTION_END asynchronously */
+    clock_value_to_restore = restoreClk;
+      
+    /* kick off the non blocking write */
+    non_blocking_write(i2caddr, 0x40, buffer_alt, count);
+  } else
+#endif
+  {
   if(wire) { // I2C
     wire->beginTransmission(i2caddr);
     WIRE_WRITE((uint8_t)0x40);
@@ -927,6 +1059,7 @@ void Adafruit_SSD1306::display(void) {
 #if defined(ESP8266)
   yield();
 #endif
+  }
 }
 
 // SCROLLING FUNCTIONS -----------------------------------------------------
@@ -1089,4 +1222,8 @@ void Adafruit_SSD1306::dim(boolean dim) {
   ssd1306_command1(SSD1306_SETCONTRAST);
   ssd1306_command1(dim ? 0 : contrast);
   TRANSACTION_END
+}
+
+void Adafruit_SSD1306::display_flush(void) {
+  non_blocking_write_flush();
 }

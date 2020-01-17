@@ -143,6 +143,7 @@ class Adafruit_SSD1306 : public Adafruit_GFX {
                  uint8_t i2caddr=0, boolean reset=true,
                  boolean periphBegin=true);
   void         display(void);
+  void         display_flush(void);
   void         clearDisplay(void);
   void         invertDisplay(boolean i);
   void         dim(boolean dim);
